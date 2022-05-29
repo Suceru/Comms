@@ -21,7 +21,7 @@ public class Peer : IDisposable
 		{
 			MessageTypesByMessageId = new Dictionary<int, Type>();
 			MessageIdsByMessageTypes = new Dictionary<Type, int>();
-			TypeInfo[] array = (from t in typeof(Message).GetTypeInfo().get_Assembly().DefinedTypes
+			TypeInfo[] array = (from t in typeof(Message).GetTypeInfo().Assembly.DefinedTypes
 				where typeof(Message).GetTypeInfo().IsAssignableFrom(t)
 				orderby t.Name
 				select t).ToArray();
