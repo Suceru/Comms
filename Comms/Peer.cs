@@ -1,17 +1,16 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
+using System.Diagnostics;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
-using System.Threading.Tasks;
 
 namespace Comms;
 
 public class Peer : IDisposable
 {
-	internal abstract class Message
+	private abstract class Message
 	{
 		private static Dictionary<int, Type> MessageTypesByMessageId;
 
@@ -34,12 +33,12 @@ public class Peer : IDisposable
 
 		public static Message Read(byte[] bytes)
 		{
-			BinaryReader binaryReader = new BinaryReader(new MemoryStream(bytes));
-			byte key = binaryReader.ReadByte();
+			Reader reader = new Reader(bytes);
+			byte key = reader.ReadByte();
 			if (MessageTypesByMessageId.TryGetValue(key, out var value))
 			{
 				Message obj = (Message)Activator.CreateInstance(value);
-				obj.Read(binaryReader);
+				obj.Read(reader);
 				return obj;
 			}
 			return null;
@@ -47,70 +46,44 @@ public class Peer : IDisposable
 
 		public static byte[] Write(Message message)
 		{
-			BinaryWriter binaryWriter = new BinaryWriter(new MemoryStream());
-			binaryWriter.Write((byte)MessageIdsByMessageTypes[message.GetType()]);
-			message.Write(binaryWriter);
-			return ((MemoryStream)binaryWriter.BaseStream).ToArray();
+			Writer writer = new Writer();
+			writer.WriteByte((byte)MessageIdsByMessageTypes[message.GetType()]);
+			message.Write(writer);
+			return writer.GetBytes();
 		}
 
 		public static void Handle(Peer peer, Packet packet)
 		{
-			Message message = Read(packet.Data);
+			Message message = Read(packet.Bytes);
 			if (message != null)
 			{
 				message.Handle(peer, packet.Address);
 				return;
 			}
-			throw new InvalidOperationException("Unrecognized message.");
+			throw new ProtocolViolationException("Unrecognized message, ignoring.");
 		}
 
-		protected abstract void Read(BinaryReader reader);
+		protected abstract void Read(Reader reader);
 
-		protected abstract void Write(BinaryWriter writer);
+		protected abstract void Write(Writer writer);
 
 		protected virtual void Handle(Peer peer, IPEndPoint address)
 		{
 		}
-
-		protected static IPEndPoint ReadAddress(BinaryReader reader)
-		{
-			byte family = reader.ReadByte();
-			byte b = reader.ReadByte();
-			byte[] array = reader.ReadBytes(b);
-			SocketAddress socketAddress = new SocketAddress((AddressFamily)family, b);
-			for (int i = 0; i < array.Length; i++)
-			{
-				socketAddress[i] = array[i];
-			}
-			return (IPEndPoint)new IPEndPoint((socketAddress.Family == AddressFamily.InterNetworkV6) ? IPAddress.IPv6Any : IPAddress.Any, 0).Create(socketAddress);
-		}
-
-		protected static void WriteAddress(BinaryWriter writer, IPEndPoint address)
-		{
-			SocketAddress socketAddress = address.Serialize();
-			byte[] array = new byte[socketAddress.Size];
-			for (int i = 0; i < array.Length; i++)
-			{
-				array[i] = socketAddress[i];
-			}
-			writer.Write((byte)socketAddress.Family);
-			writer.Write((byte)array.Length);
-			writer.Write(array);
-		}
 	}
 
-	internal class DiscoveryRequestMessage : Message
+	private class DiscoveryRequestMessage : Message
 	{
 		public byte[] DiscoveryRequestData;
 
-		protected override void Read(BinaryReader reader)
+		protected override void Read(Reader reader)
 		{
-			DiscoveryRequestData = reader.ReadBytes((int)(reader.BaseStream.Length - reader.BaseStream.Position));
+			DiscoveryRequestData = reader.ReadFixedBytes(reader.Length - reader.Position);
 		}
 
-		protected override void Write(BinaryWriter writer)
+		protected override void Write(Writer writer)
 		{
-			writer.Write(DiscoveryRequestData);
+			writer.WriteFixedBytes(DiscoveryRequestData);
 		}
 
 		protected override void Handle(Peer peer, IPEndPoint address)
@@ -126,18 +99,18 @@ public class Peer : IDisposable
 		}
 	}
 
-	internal class DiscoveryResponseMessage : Message
+	private class DiscoveryResponseMessage : Message
 	{
 		public byte[] DiscoveryResponseData;
 
-		protected override void Read(BinaryReader reader)
+		protected override void Read(Reader reader)
 		{
-			DiscoveryResponseData = reader.ReadBytes((int)(reader.BaseStream.Length - reader.BaseStream.Position));
+			DiscoveryResponseData = reader.ReadFixedBytes(reader.Length - reader.Position);
 		}
 
-		protected override void Write(BinaryWriter writer)
+		protected override void Write(Writer writer)
 		{
-			writer.Write(DiscoveryResponseData);
+			writer.WriteFixedBytes(DiscoveryResponseData);
 		}
 
 		protected override void Handle(Peer peer, IPEndPoint address)
@@ -146,25 +119,25 @@ public class Peer : IDisposable
 		}
 	}
 
-	internal class ConnectRequestMessage : Message
+	private class ConnectRequestMessage : Message
 	{
 		public byte[] ConnectRequestData;
 
-		protected override void Read(BinaryReader reader)
+		protected override void Read(Reader reader)
 		{
-			ConnectRequestData = reader.ReadBytes((int)(reader.BaseStream.Length - reader.BaseStream.Position));
+			ConnectRequestData = reader.ReadFixedBytes(reader.Length - reader.Position);
 		}
 
-		protected override void Write(BinaryWriter writer)
+		protected override void Write(Writer writer)
 		{
-			writer.Write(ConnectRequestData);
+			writer.WriteFixedBytes(ConnectRequestData);
 		}
 
 		protected override void Handle(Peer peer, IPEndPoint address)
 		{
 			if (peer.FindPeer(address) == null)
 			{
-				PeerData peerData = new PeerData(address);
+				PeerData peerData = new PeerData(peer, address);
 				if (peer.ConnectRequest != null)
 				{
 					peer.ConnectRequest(new PeerPacket(peerData, ConnectRequestData));
@@ -175,91 +148,92 @@ public class Peer : IDisposable
 				}
 				return;
 			}
-			throw new InvalidOperationException("Connect request ignored, peer already connected.");
+			throw new ProtocolViolationException("Connect request ignored, peer already connected.");
 		}
 	}
 
-	internal class ConnectAcceptedMessage : Message
+	private class ConnectAcceptedMessage : Message
 	{
 		public IPEndPoint[] PeersAddresses;
 
 		public byte[] ConnectAcceptedData;
 
-		protected override void Read(BinaryReader reader)
+		protected override void Read(Reader reader)
 		{
-			int num = reader.ReadInt16();
+			int num = reader.ReadUInt16();
 			PeersAddresses = new IPEndPoint[num];
 			for (int i = 0; i < num; i++)
 			{
-				PeersAddresses[i] = Message.ReadAddress(reader);
+				PeersAddresses[i] = reader.ReadIPEndPoint();
 			}
-			ConnectAcceptedData = reader.ReadBytes((int)(reader.BaseStream.Length - reader.BaseStream.Position));
+			ConnectAcceptedData = reader.ReadFixedBytes(reader.Length - reader.Position);
 		}
 
-		protected override void Write(BinaryWriter writer)
+		protected override void Write(Writer writer)
 		{
-			writer.Write((short)PeersAddresses.Length);
-			for (int i = 0; i < PeersAddresses.Length; i++)
+			int num = Math.Min(PeersAddresses.Length, 65535);
+			writer.WriteUInt16((ushort)num);
+			for (int i = 0; i < num; i++)
 			{
-				Message.WriteAddress(writer, PeersAddresses[i]);
+				writer.WriteIPEndPoint(PeersAddresses[i]);
 			}
-			writer.Write(ConnectAcceptedData);
+			writer.WriteFixedBytes(ConnectAcceptedData);
 		}
 
 		protected override void Handle(Peer peer, IPEndPoint address)
 		{
 			if (peer.ConnectedTo != null)
 			{
-				throw new InvalidOperationException("Unexpected connection accept ignored, peer already connected.");
+				throw new ProtocolViolationException("Unexpected connection accept ignored, peer already connected.");
 			}
 			if (!object.Equals(peer.ConnectingTo, address))
 			{
-				throw new InvalidOperationException($"Unexpected connection accept from {address} ignored.");
+				throw new ProtocolViolationException($"Unexpected connection accept from {address} ignored.");
 			}
-			peer.ConnectedTo = new PeerData(address);
+			peer.ConnectedTo = new PeerData(peer, address);
 			peer.ConnectingTo = null;
 			peer.PeersByAddress.Clear();
 			IPEndPoint[] peersAddresses = PeersAddresses;
 			foreach (IPEndPoint iPEndPoint in peersAddresses)
 			{
-				peer.PeersByAddress.Add(iPEndPoint, new PeerData(iPEndPoint));
+				peer.PeersByAddress.Add(iPEndPoint, new PeerData(peer, iPEndPoint));
 			}
 			peer.ConnectAccepted?.Invoke(new PeerPacket(peer.ConnectedTo, ConnectAcceptedData));
 		}
 	}
 
-	internal class ConnectRefusedMessage : Message
+	private class ConnectRefusedMessage : Message
 	{
 		public byte[] ConnectRefusedData;
 
-		protected override void Read(BinaryReader reader)
+		protected override void Read(Reader reader)
 		{
-			ConnectRefusedData = reader.ReadBytes((int)(reader.BaseStream.Length - reader.BaseStream.Position));
+			ConnectRefusedData = reader.ReadFixedBytes(reader.Length - reader.Position);
 		}
 
-		protected override void Write(BinaryWriter writer)
+		protected override void Write(Writer writer)
 		{
-			writer.Write(ConnectRefusedData);
+			writer.WriteFixedBytes(ConnectRefusedData);
 		}
 
 		protected override void Handle(Peer peer, IPEndPoint address)
 		{
 			if (peer.ConnectedTo != null || !object.Equals(peer.ConnectingTo, address))
 			{
-				throw new InvalidOperationException("Unexpected connection refuse ignored.");
+				throw new ProtocolViolationException("Unexpected connection refuse ignored.");
 			}
 			peer.ConnectingTo = null;
 			peer.ConnectRefused?.Invoke(new Packet(address, ConnectRefusedData));
 		}
 	}
 
-	internal class DisconnectRequestMessage : Message
+	private class DisconnectRequestMessage : Message
 	{
-		protected override void Read(BinaryReader reader)
+		protected override void Read(Reader reader)
 		{
 		}
 
-		protected override void Write(BinaryWriter writer)
+		protected override void Write(Writer writer)
 		{
 		}
 
@@ -285,13 +259,13 @@ public class Peer : IDisposable
 		}
 	}
 
-	internal class DisconnectedMessage : Message
+	private class DisconnectedMessage : Message
 	{
-		protected override void Read(BinaryReader reader)
+		protected override void Read(Reader reader)
 		{
 		}
 
-		protected override void Write(BinaryWriter writer)
+		protected override void Write(Writer writer)
 		{
 		}
 
@@ -304,18 +278,18 @@ public class Peer : IDisposable
 		}
 	}
 
-	internal class PeerConnectedMessage : Message
+	private class PeerConnectedMessage : Message
 	{
 		public IPEndPoint PeerAddress;
 
-		protected override void Read(BinaryReader reader)
+		protected override void Read(Reader reader)
 		{
-			PeerAddress = Message.ReadAddress(reader);
+			PeerAddress = reader.ReadIPEndPoint();
 		}
 
-		protected override void Write(BinaryWriter writer)
+		protected override void Write(Writer writer)
 		{
-			Message.WriteAddress(writer, PeerAddress);
+			writer.WriteIPEndPoint(PeerAddress);
 		}
 
 		protected override void Handle(Peer peer, IPEndPoint address)
@@ -324,27 +298,27 @@ public class Peer : IDisposable
 			{
 				if (peer.FindPeer(address) != null)
 				{
-					throw new InvalidOperationException("Peer connection notification ignored, peer already connected.");
+					throw new ProtocolViolationException("Peer connection notification ignored, peer already connected.");
 				}
-				PeerData peerData = new PeerData(PeerAddress);
+				PeerData peerData = new PeerData(peer, PeerAddress);
 				peer.PeersByAddress.Add(PeerAddress, peerData);
 				peer.PeerConnected?.Invoke(peerData);
 			}
 		}
 	}
 
-	internal class PeerDisconnectedMessage : Message
+	private class PeerDisconnectedMessage : Message
 	{
 		public IPEndPoint PeerAddress;
 
-		protected override void Read(BinaryReader reader)
+		protected override void Read(Reader reader)
 		{
-			PeerAddress = Message.ReadAddress(reader);
+			PeerAddress = reader.ReadIPEndPoint();
 		}
 
-		protected override void Write(BinaryWriter writer)
+		protected override void Write(Writer writer)
 		{
-			Message.WriteAddress(writer, PeerAddress);
+			writer.WriteIPEndPoint(PeerAddress);
 		}
 
 		protected override void Handle(Peer peer, IPEndPoint address)
@@ -361,18 +335,18 @@ public class Peer : IDisposable
 		}
 	}
 
-	internal class KeepAliveRequestMessage : Message
+	private class KeepAliveRequestMessage : Message
 	{
 		public double RequestSendTime;
 
-		protected override void Read(BinaryReader reader)
+		protected override void Read(Reader reader)
 		{
 			RequestSendTime = reader.ReadDouble();
 		}
 
-		protected override void Write(BinaryWriter writer)
+		protected override void Write(Writer writer)
 		{
-			writer.Write(RequestSendTime);
+			writer.WriteDouble(RequestSendTime);
 		}
 
 		protected override void Handle(Peer peer, IPEndPoint address)
@@ -389,18 +363,18 @@ public class Peer : IDisposable
 		}
 	}
 
-	internal class KeepAliveResponseMessage : Message
+	private class KeepAliveResponseMessage : Message
 	{
 		public double RequestSendTime;
 
-		protected override void Read(BinaryReader reader)
+		protected override void Read(Reader reader)
 		{
 			RequestSendTime = reader.ReadDouble();
 		}
 
-		protected override void Write(BinaryWriter writer)
+		protected override void Write(Writer writer)
 		{
-			writer.Write(RequestSendTime);
+			writer.WriteDouble(RequestSendTime);
 		}
 
 		protected override void Handle(Peer peer, IPEndPoint address)
@@ -415,18 +389,18 @@ public class Peer : IDisposable
 		}
 	}
 
-	internal class DataMessage : Message
+	private class DataMessage : Message
 	{
 		public byte[] Bytes;
 
-		protected override void Read(BinaryReader reader)
+		protected override void Read(Reader reader)
 		{
-			Bytes = reader.ReadBytes((int)(reader.BaseStream.Length - reader.BaseStream.Position));
+			Bytes = reader.ReadFixedBytes(reader.Length - reader.Position);
 		}
 
-		protected override void Write(BinaryWriter writer)
+		protected override void Write(Writer writer)
 		{
-			writer.Write(Bytes);
+			writer.WriteFixedBytes(Bytes);
 		}
 
 		protected override void Handle(Peer peer, IPEndPoint address)
@@ -446,14 +420,15 @@ public class Peer : IDisposable
 
 	private volatile bool IsDisposed;
 
-	private Task Task;
+	private Alarm Alarm;
 
 	private double ConnectStartTime;
 
+	private List<PeerData> PeersData = new List<PeerData>();
+
 	private Dictionary<IPEndPoint, PeerData> PeersByAddress = new Dictionary<IPEndPoint, PeerData>();
 
-	public object Lock { get; } = new object();
-
+	public object Lock => Comm.Lock;
 
 	public Comm Comm { get; private set; }
 
@@ -472,12 +447,15 @@ public class Peer : IDisposable
 		{
 			lock (Lock)
 			{
+				CheckNotDisposedAndStarted();
 				return PeersByAddress.Values.ToArray();
 			}
 		}
 	}
 
 	public event Action<Exception> Error;
+
+	public event Action<string> Debug;
 
 	public event Action<Packet> PeerDiscoveryRequest;
 
@@ -500,63 +478,71 @@ public class Peer : IDisposable
 	public event Action<PeerPacket> DataMessageReceived;
 
 	public Peer(int localPort = 0)
-		: this(new UdpPacketTransmitter(localPort))
+		: this(new UdpTransmitter(localPort))
 	{
 	}
 
-	public Peer(IPacketTransmitter transmitter)
+	public Peer(ITransmitter transmitter)
 	{
 		Comm = new Comm(transmitter);
 		Comm.Error += delegate(Exception e)
 		{
-			this.Error?.Invoke(e);
+			InvokeError(e);
 		};
 		Comm.Received += delegate(Packet packet)
 		{
 			try
 			{
-				lock (Lock)
+				if (!IsDisposed)
 				{
-					if (!IsDisposed)
-					{
-						Message.Handle(this, packet);
-					}
+					Message.Handle(this, packet);
 				}
 			}
-			catch (Exception obj)
+			catch (Exception e2)
 			{
-				this.Error?.Invoke(obj);
+				InvokeError(e2);
 			}
 		};
-		Task = Task.Factory.StartNew(ThreadFunction, TaskCreationOptions.LongRunning);
 	}
 
 	public void Dispose()
 	{
-		if (IsDisposed)
-		{
-			return;
-		}
 		lock (Lock)
 		{
+			if (IsDisposed)
+			{
+				return;
+			}
 			IsDisposed = true;
 		}
-		Task.Wait();
+		Alarm?.Dispose();
+		Comm?.Dispose();
+	}
+
+	public void Start()
+	{
 		lock (Lock)
 		{
-			if (Comm != null)
+			CheckNotDisposed();
+			if (Alarm != null)
 			{
-				Comm.Dispose();
-				Comm = null;
+				throw new InvalidOperationException("Peer is already started.");
 			}
+			Comm.Start();
+			Alarm = new Alarm(AlarmFunction);
+			Alarm.Error += delegate(Exception e)
+			{
+				InvokeError(e);
+			};
+			Alarm.Set(0.0);
 		}
 	}
 
 	public PeerData FindPeer(IPEndPoint address)
 	{
-		CheckNotDisposed();
 		lock (Lock)
 		{
+			CheckNotDisposedAndStarted();
 			PeerData value;
 			return PeersByAddress.TryGetValue(address, out value) ? value : null;
 		}
@@ -564,56 +550,65 @@ public class Peer : IDisposable
 
 	public void DiscoverLocalPeers(int peerPort, byte[] discoveryQueryData = null)
 	{
-		CheckNotDisposed();
-		if (Comm.Address.AddressFamily == AddressFamily.InterNetworkV6)
+		lock (Lock)
 		{
-			InternalSend(new IPEndPoint(UdpPacketTransmitter.IPV6BroadcastAddress, peerPort), DeliveryMode.Raw, new DiscoveryRequestMessage
+			CheckNotDisposedAndStarted();
+			if (Comm.Address.AddressFamily == AddressFamily.InterNetworkV6)
 			{
-				DiscoveryRequestData = (discoveryQueryData ?? new byte[0])
-			});
-		}
-		else
-		{
-			InternalSend(new IPEndPoint(IPAddress.Broadcast, peerPort), DeliveryMode.Raw, new DiscoveryRequestMessage
+				InternalSend(new IPEndPoint(UdpTransmitter.IPV6BroadcastAddress, peerPort), DeliveryMode.Raw, new DiscoveryRequestMessage
+				{
+					DiscoveryRequestData = (discoveryQueryData ?? new byte[0])
+				});
+			}
+			else
 			{
-				DiscoveryRequestData = (discoveryQueryData ?? new byte[0])
-			});
+				InternalSend(new IPEndPoint(UdpTransmitter.IPV4BroadcastAddress, peerPort), DeliveryMode.Raw, new DiscoveryRequestMessage
+				{
+					DiscoveryRequestData = (discoveryQueryData ?? new byte[0])
+				});
+			}
 		}
 	}
 
 	public void DiscoverPeer(IPEndPoint address, byte[] discoveryQueryData = null)
 	{
-		CheckNotDisposed();
-		InternalSend(address, DeliveryMode.Raw, new DiscoveryRequestMessage
+		lock (Lock)
 		{
-			DiscoveryRequestData = (discoveryQueryData ?? new byte[0])
-		});
+			CheckNotDisposedAndStarted();
+			InternalSend(address, DeliveryMode.Raw, new DiscoveryRequestMessage
+			{
+				DiscoveryRequestData = (discoveryQueryData ?? new byte[0])
+			});
+		}
 	}
 
 	public void Connect(IPEndPoint address, byte[] connectRequestData = null)
 	{
-		CheckNotDisposed();
 		lock (Lock)
 		{
-			if (ConnectedTo == null && ConnectingTo == null)
+			CheckNotDisposedAndStarted();
+			if (ConnectedTo != null)
 			{
-				ConnectingTo = address;
-				ConnectStartTime = Comm.GetTime();
-				InternalSend(address, DeliveryMode.ReliableSequenced, new ConnectRequestMessage
-				{
-					ConnectRequestData = (connectRequestData ?? new byte[0])
-				});
-				return;
+				throw new InvalidOperationException("Peer is already connected.");
 			}
-			throw new InvalidOperationException("Connect is not allowed.");
+			if (ConnectingTo != null)
+			{
+				throw new InvalidOperationException("Peer is already connecting.");
+			}
+			ConnectingTo = address;
+			ConnectStartTime = Comm.GetTime();
+			InternalSend(address, DeliveryMode.ReliableSequenced, new ConnectRequestMessage
+			{
+				ConnectRequestData = (connectRequestData ?? new byte[0])
+			});
 		}
 	}
 
 	public void Disconnect()
 	{
-		CheckNotDisposed();
 		lock (Lock)
 		{
+			CheckNotDisposedAndStarted();
 			if (ConnectedTo != null)
 			{
 				InternalSend(ConnectedTo.Address, DeliveryMode.ReliableSequenced, new DisconnectRequestMessage());
@@ -624,9 +619,9 @@ public class Peer : IDisposable
 
 	public void RespondToDiscovery(IPEndPoint address, DeliveryMode deliveryMode, byte[] discoveryResponseData = null)
 	{
-		CheckNotDisposed();
 		lock (Lock)
 		{
+			CheckNotDisposedAndStarted();
 			InternalSend(address, deliveryMode, new DiscoveryResponseMessage
 			{
 				DiscoveryResponseData = (discoveryResponseData ?? new byte[0])
@@ -636,9 +631,9 @@ public class Peer : IDisposable
 
 	public void AcceptConnect(PeerData peerData, byte[] connectAcceptedData = null)
 	{
-		CheckNotDisposed();
 		lock (Lock)
 		{
+			CheckNotDisposedAndStarted();
 			if (peerData == null || peerData == ConnectedTo || peerData.Address == ConnectingTo || Peers.Contains(peerData))
 			{
 				throw new ArgumentException("peerData");
@@ -648,7 +643,7 @@ public class Peer : IDisposable
 				ConnectAcceptedData = (connectAcceptedData ?? new byte[0]),
 				PeersAddresses = (Settings.SendPeerConnectDisconnectNotifications ? PeersByAddress.Keys.ToArray() : new IPEndPoint[0])
 			});
-			if (Settings.SendPeerConnectDisconnectNotifications)
+			if (Settings.SendPeerConnectDisconnectNotifications && PeersByAddress.Count > 0)
 			{
 				foreach (PeerData value in PeersByAddress.Values)
 				{
@@ -665,9 +660,9 @@ public class Peer : IDisposable
 
 	public void RefuseConnect(PeerData peerData, byte[] refuseConnectData = null)
 	{
-		CheckNotDisposed();
 		lock (Lock)
 		{
+			CheckNotDisposedAndStarted();
 			if (peerData == null || peerData == ConnectedTo || peerData.Address == ConnectingTo || Peers.Contains(peerData))
 			{
 				throw new ArgumentException("peerData");
@@ -681,9 +676,9 @@ public class Peer : IDisposable
 
 	public void SendDataMessage(PeerData peerData, DeliveryMode deliveryMode, byte[] bytes)
 	{
-		CheckNotDisposed();
 		lock (Lock)
 		{
+			CheckNotDisposedAndStarted();
 			if (peerData == null || (peerData != ConnectedTo && !Peers.Contains(peerData)))
 			{
 				throw new ArgumentException("peerData");
@@ -697,9 +692,9 @@ public class Peer : IDisposable
 
 	public void SendDataMessages(PeerData peerData, DeliveryMode deliveryMode, IEnumerable<byte[]> bytes)
 	{
-		CheckNotDisposed();
 		lock (Lock)
 		{
+			CheckNotDisposedAndStarted();
 			if (peerData == null || (peerData != ConnectedTo && !Peers.Contains(peerData)))
 			{
 				throw new ArgumentException("peerData");
@@ -714,9 +709,9 @@ public class Peer : IDisposable
 
 	public void DisconnectPeer(PeerData peerData)
 	{
-		CheckNotDisposed();
 		lock (Lock)
 		{
+			CheckNotDisposedAndStarted();
 			if (!PeersByAddress.ContainsValue(peerData))
 			{
 				return;
@@ -739,9 +734,9 @@ public class Peer : IDisposable
 
 	public void DisconnectAllPeers()
 	{
-		CheckNotDisposed();
 		lock (Lock)
 		{
+			CheckNotDisposedAndStarted();
 			PeerData[] array = PeersByAddress.Values.ToArray();
 			foreach (PeerData peerData in array)
 			{
@@ -750,73 +745,77 @@ public class Peer : IDisposable
 		}
 	}
 
-	private void ThreadFunction()
+	private void AlarmFunction()
 	{
-		List<PeerData> list = new List<PeerData>();
-		while (!IsDisposed)
+		lock (Lock)
 		{
-			lock (Lock)
+			if (!IsDisposed)
 			{
-				double time = Comm.GetTime();
-				list.Clear();
-				if (ConnectedTo != null)
+				ProcessPeers();
+				float num = 0.25f;
+				float num2 = Math.Min(Settings.KeepAlivePeriod, Math.Min(Settings.KeepAliveResendPeriod, Math.Min(Settings.ConnectTimeOut, Settings.ConnectionLostPeriod)));
+				Alarm.Set(Math.Max(num2 * num, 0.01f));
+			}
+		}
+	}
+
+	private void ProcessPeers()
+	{
+		PeersData.Clear();
+		if (ConnectedTo != null)
+		{
+			PeersData.Add(ConnectedTo);
+		}
+		else
+		{
+			PeersData.AddRange(PeersByAddress.Values);
+		}
+		double time = Comm.GetTime();
+		foreach (PeerData peersDatum in PeersData)
+		{
+			double num = time - peersDatum.LastKeepAliveReceiveTime;
+			if (num >= (double)Settings.ConnectionLostPeriod)
+			{
+				if (peersDatum == ConnectedTo)
 				{
-					list.Add(ConnectedTo);
+					InvokeError(new KeepAliveTimeoutException($"Server {peersDatum.Address} did not respond for {num:0.0}s, disconnecting."));
+					Disconnect();
 				}
 				else
 				{
-					list.AddRange(PeersByAddress.Values);
-				}
-				foreach (PeerData item in list)
-				{
-					double num = time - item.LastKeepAliveReceiveTime;
-					if (num >= (double)Settings.ConnectionLostPeriod)
-					{
-						if (item == ConnectedTo)
-						{
-							this.Error?.Invoke(new KeepAliveTimeoutException($"Server {item.Address} did not respond for {num:0.0}s, disconnecting."));
-							Disconnect();
-						}
-						else
-						{
-							this.Error?.Invoke(new KeepAliveTimeoutException($"Peer {item.Address} did not respond for {num:0.0}s, disconnecting."));
-							DisconnectPeer(item);
-						}
-					}
-					else if (time >= item.NextKeepAliveSendTime)
-					{
-						InternalSend(item.Address, DeliveryMode.Unreliable, new KeepAliveRequestMessage
-						{
-							RequestSendTime = time
-						});
-						item.NextKeepAliveSendTime = time + (double)Settings.KeepAliveResendPeriod;
-					}
-				}
-				if (ConnectingTo != null && time - ConnectStartTime >= (double)Settings.ConnectTimeOut)
-				{
-					IPEndPoint connectingTo = ConnectingTo;
-					ConnectingTo = null;
-					try
-					{
-						this.ConnectTimedOut?.Invoke(connectingTo);
-					}
-					catch (Exception obj)
-					{
-						this.Error?.Invoke(obj);
-					}
+					InvokeError(new KeepAliveTimeoutException($"Peer {peersDatum.Address} did not respond for {num:0.0}s, disconnecting."));
+					DisconnectPeer(peersDatum);
 				}
 			}
-			float num2 = 0.2f;
-			float num3 = Math.Min(Settings.KeepAlivePeriod, Math.Min(Settings.KeepAliveResendPeriod, Math.Min(Settings.ConnectTimeOut, Settings.ConnectionLostPeriod)));
-			Task.Delay(Math.Min(Math.Max((int)(1000f * num3 * num2), 10), 250)).Wait();
+			else if (time >= peersDatum.NextKeepAliveSendTime)
+			{
+				InternalSend(peersDatum.Address, DeliveryMode.Unreliable, new KeepAliveRequestMessage
+				{
+					RequestSendTime = time
+				});
+				peersDatum.NextKeepAliveSendTime = time + (double)Settings.KeepAliveResendPeriod;
+			}
+		}
+		if (ConnectingTo != null && time - ConnectStartTime >= (double)Settings.ConnectTimeOut)
+		{
+			IPEndPoint connectingTo = ConnectingTo;
+			ConnectingTo = null;
+			try
+			{
+				this.ConnectTimedOut?.Invoke(connectingTo);
+			}
+			catch (Exception e)
+			{
+				InvokeError(e);
+			}
 		}
 	}
 
 	private void InternalDisconnect()
 	{
 		ConnectedTo = null;
-		PeersByAddress.Clear();
 		ConnectingTo = null;
+		PeersByAddress.Clear();
 		this.Disconnected?.Invoke();
 	}
 
@@ -841,6 +840,29 @@ public class Peer : IDisposable
 		if (IsDisposed)
 		{
 			throw new ObjectDisposedException("Peer");
+		}
+	}
+
+	private void CheckNotDisposedAndStarted()
+	{
+		CheckNotDisposed();
+		if (Alarm == null)
+		{
+			throw new InvalidOperationException("Peer is not started.");
+		}
+	}
+
+	private void InvokeError(Exception e)
+	{
+		this.Error?.Invoke(e);
+	}
+
+	[Conditional("DEBUG")]
+	private void InvokeDebug(string format, params object[] args)
+	{
+		if (this.Debug != null)
+		{
+			this.Debug?.Invoke(string.Format(format, args));
 		}
 	}
 }

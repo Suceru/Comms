@@ -1,11 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.IO;
 using System.Linq;
 using System.Net;
-using System.Threading;
-using System.Threading.Tasks;
 
 namespace Comms;
 
@@ -18,6 +15,8 @@ public class Comm
 		public Guid TheirGuid;
 
 		public bool InitAckReceived;
+
+		public bool InitAckConfirmed;
 
 		public Dictionary<uint, UnackedPacket> UnackedPackets = new Dictionary<uint, UnackedPacket>();
 
@@ -40,6 +39,8 @@ public class Comm
 		public uint? NextReliableReceiveSequenceIndex;
 
 		public uint NextReliableSendSequenceIndex;
+
+		public double LastInitAckSendTime = double.MinValue;
 
 		public double LastSendTime = double.MinValue;
 
@@ -88,10 +89,10 @@ public class Comm
 
 		public Guid InitGuid;
 
-		public static PacketHeader Read(BinaryReader reader)
+		public static PacketHeader Read(Reader reader)
 		{
 			PacketHeader result = default(PacketHeader);
-			if (reader.BaseStream.Length - reader.BaseStream.Position >= 1)
+			if (reader.Length - reader.Position >= 1)
 			{
 				byte b = reader.ReadByte();
 				result.PacketType = (PacketType)(b & 0xFu);
@@ -103,11 +104,11 @@ public class Comm
 				{
 					result.IsConnectionInit = (b & 0x80) != 0;
 					int num = (result.IsConnectionInit ? 20 : 4);
-					if (reader.BaseStream.Length - reader.BaseStream.Position >= num)
+					if (reader.Length - reader.Position >= num)
 					{
 						if (result.IsConnectionInit)
 						{
-							result.InitGuid = new Guid(reader.ReadBytes(16));
+							result.InitGuid = new Guid(reader.ReadFixedBytes(16));
 						}
 						result.PacketId = reader.ReadUInt32();
 						return result;
@@ -115,14 +116,14 @@ public class Comm
 				}
 				else if (result.PacketType == PacketType.DataAck)
 				{
-					if (reader.BaseStream.Length - reader.BaseStream.Position >= 4)
+					if (reader.Length - reader.Position >= 4)
 					{
 						return result;
 					}
 				}
-				else if (result.PacketType == PacketType.InitAck && reader.BaseStream.Length - reader.BaseStream.Position == 16)
+				else if (result.PacketType == PacketType.InitAck && reader.Length - reader.Position == 16)
 				{
-					result.InitGuid = new Guid(reader.ReadBytes(16));
+					result.InitGuid = new Guid(reader.ReadFixedBytes(16));
 					return result;
 				}
 			}
@@ -130,35 +131,35 @@ public class Comm
 			return result;
 		}
 
-		public static void WriteRaw(BinaryWriter writer)
+		public static void WriteRaw(Writer writer)
 		{
-			writer.Write((byte)1);
+			writer.WriteByte(1);
 		}
 
-		public static void WriteData(BinaryWriter writer, Guid? initGuid, uint packetId, bool requiresAck)
+		public static void WriteData(Writer writer, Guid? initGuid, uint packetId, bool requiresAck)
 		{
 			byte b = (byte)(requiresAck ? 3 : 2);
 			if (initGuid.HasValue)
 			{
 				b = (byte)(b | 0x80u);
 			}
-			writer.Write(b);
+			writer.WriteByte(b);
 			if (initGuid.HasValue)
 			{
-				writer.Write(initGuid.Value.ToByteArray());
+				writer.WriteFixedBytes(initGuid.Value.ToByteArray());
 			}
-			writer.Write(packetId);
+			writer.WriteUInt32(packetId);
 		}
 
-		public static void WriteDataAck(BinaryWriter writer)
+		public static void WriteDataAck(Writer writer)
 		{
-			writer.Write((byte)4);
+			writer.WriteByte(4);
 		}
 
-		public static void WriteInitAck(BinaryWriter writer, Guid initGuid)
+		public static void WriteInitAck(Writer writer, Guid initGuid)
 		{
-			writer.Write((byte)5);
-			writer.Write(initGuid.ToByteArray());
+			writer.WriteByte(5);
+			writer.WriteFixedBytes(initGuid.ToByteArray());
 		}
 	}
 
@@ -176,7 +177,7 @@ public class Comm
 
 		public int DataSize;
 
-		public static MessagePartHeader Read(BinaryReader reader)
+		public static MessagePartHeader Read(Reader reader)
 		{
 			MessagePartHeader result = default(MessagePartHeader);
 			try
@@ -184,19 +185,18 @@ public class Comm
 				byte b = reader.ReadByte();
 				result.MessageId = ((((uint)b & (true ? 1u : 0u)) != 0 || (b & 4) == 0) ? reader.ReadUInt32() : 0u);
 				result.SequenceIndex = (((b & 8u) != 0) ? new uint?(reader.ReadUInt32()) : null);
-				result.PartIndex = ((((uint)b & (true ? 1u : 0u)) != 0) ? Read7BitEncodedInt(reader) : 0);
-				result.DataSize = (((b & 2u) != 0) ? Read7BitEncodedInt(reader) : (-1));
+				result.PartIndex = ((((uint)b & (true ? 1u : 0u)) != 0) ? reader.ReadPackedInt32() : 0);
+				result.DataSize = (((b & 2u) != 0) ? reader.ReadPackedInt32() : (-1));
 				result.IsFinalPart = (b & 4) != 0;
-				return result;
 			}
-			catch (EndOfStreamException)
+			catch (Exception)
 			{
 				result.IsInvalid = true;
-				return result;
 			}
+			return result;
 		}
 
-		public static void Write(BinaryWriter writer, uint messageId, uint? sequenceIndex, int partIndex, bool isFinalPart, int dataSize)
+		public static void Write(Writer writer, uint messageId, uint? sequenceIndex, int partIndex, bool isFinalPart, int dataSize)
 		{
 			byte b = 0;
 			if (partIndex != 0)
@@ -215,22 +215,22 @@ public class Comm
 			{
 				b = (byte)(b | 8u);
 			}
-			writer.Write(b);
+			writer.WriteByte(b);
 			if (partIndex != 0 || !isFinalPart)
 			{
-				writer.Write(messageId);
+				writer.WriteUInt32(messageId);
 			}
 			if (sequenceIndex.HasValue)
 			{
-				writer.Write(sequenceIndex.Value);
+				writer.WriteUInt32(sequenceIndex.Value);
 			}
 			if (partIndex != 0)
 			{
-				Write7BitEncodedInt(writer, partIndex);
+				writer.WritePackedInt32(partIndex);
 			}
 			if (dataSize >= 0)
 			{
-				Write7BitEncodedInt(writer, dataSize);
+				writer.WritePackedInt32(dataSize);
 			}
 		}
 	}
@@ -244,53 +244,9 @@ public class Comm
 		public Packet Packet;
 	}
 
-	private abstract class Job
-	{
-		public abstract void Execute(Comm comm);
-	}
-
-	private class SendMessagesJob : Job
-	{
-		public IPEndPoint Address;
-
-		public DeliveryMode DeliveryMode;
-
-		public byte[][] Bytes;
-
-		public override void Execute(Comm comm)
-		{
-			comm.SendMessages(Address, Bytes, DeliveryMode);
-		}
-	}
-
-	private class ReceivePacketJob : Job
-	{
-		public Packet Packet;
-
-		public override void Execute(Comm comm)
-		{
-			comm.ProcessReceivedPacket(Packet);
-		}
-	}
-
-	private class QueryUnackedPacketsJob : Job
-	{
-		public IPEndPoint Address;
-
-		public ManualResetEvent CompletedEvent = new ManualResetEvent(initialState: false);
-
-		public int Result;
-
-		public override void Execute(Comm comm)
-		{
-			Result = comm.QueryUnackedPacketsCount(Address);
-			CompletedEvent.Set();
-		}
-	}
-
 	private volatile bool IsDisposed;
 
-	private Task Task;
+	private Alarm Alarm;
 
 	private uint NextPacketId;
 
@@ -298,53 +254,82 @@ public class Comm
 
 	private Dictionary<IPEndPoint, Connection> Connections = new Dictionary<IPEndPoint, Connection>();
 
-	private ProducerConsumerQueue<Job> Jobs = new ProducerConsumerQueue<Job>();
-
 	private List<uint> ToRemoveUInt = new List<uint>();
 
 	private List<IPEndPoint> ToRemoveEndpoint = new List<IPEndPoint>();
 
+	private static long StartTimestamp = Stopwatch.GetTimestamp();
+
 	public CommSettings Settings { get; private set; } = new CommSettings();
 
 
-	public IPacketTransmitter Transmitter { get; private set; }
+	public ITransmitter Transmitter { get; private set; }
 
 	public IPEndPoint Address => Transmitter.Address;
+
+	public object Lock { get; } = new object();
+
 
 	public event Action<Packet> Received;
 
 	public event Action<Exception> Error;
 
+	public event Action<string> Debug;
+
 	public Comm(int localPort = 0)
-		: this(new UdpPacketTransmitter(localPort))
+		: this(new UdpTransmitter(localPort))
 	{
 	}
 
-	public Comm(IPacketTransmitter transmitter)
+	public Comm(ITransmitter transmitter)
 	{
 		Transmitter = transmitter ?? throw new ArgumentNullException("transmitter");
-		Transmitter.Error += delegate(Exception e)
+	}
+
+	public void Start()
+	{
+		lock (Lock)
 		{
-			this.Error?.Invoke(e);
-		};
-		Transmitter.PacketReceived += delegate(Packet packet)
-		{
-			Jobs.Add(new ReceivePacketJob
+			CheckNotDisposed();
+			if (Alarm != null)
 			{
-				Packet = packet
-			});
-		};
-		Task = Task.Factory.StartNew(ThreadFunction, TaskCreationOptions.LongRunning);
+				throw new InvalidOperationException("Comm is already started.");
+			}
+			Transmitter.Error += delegate(Exception e)
+			{
+				InvokeError(e);
+			};
+			Transmitter.PacketReceived += delegate(Packet packet)
+			{
+				lock (Lock)
+				{
+					if (!IsDisposed)
+					{
+						ProcessReceivedPacket(packet);
+					}
+				}
+			};
+			Alarm = new Alarm(AlarmFunction);
+			Alarm.Error += delegate(Exception e)
+			{
+				InvokeError(e);
+			};
+			Alarm.Set(0.0);
+		}
 	}
 
 	public void Dispose()
 	{
-		if (!IsDisposed)
+		lock (Lock)
 		{
+			if (IsDisposed)
+			{
+				return;
+			}
 			IsDisposed = true;
-			Task.Wait();
-			Transmitter.Dispose();
 		}
+		Alarm?.Dispose();
+		Transmitter?.Dispose();
 	}
 
 	public void Send(IPEndPoint address, DeliveryMode deliveryMode, byte[] bytes)
@@ -354,104 +339,63 @@ public class Comm
 
 	public void Send(IPEndPoint address, DeliveryMode deliveryMode, IEnumerable<byte[]> bytes)
 	{
-		CheckNotDisposed();
-		if ((object.Equals(address.Address, IPAddress.Broadcast) || object.Equals(address.Address, UdpPacketTransmitter.IPV6BroadcastAddress)) && deliveryMode != 0)
+		lock (Lock)
 		{
-			throw new InvalidOperationException("Broadcast messages must use DeliveryMode.Raw");
+			CheckNotDisposedAndStarted();
+			if ((object.Equals(address.Address, UdpTransmitter.IPV4BroadcastAddress) || object.Equals(address.Address, UdpTransmitter.IPV6BroadcastAddress)) && deliveryMode != 0)
+			{
+				throw new InvalidOperationException("Broadcast messages must use DeliveryMode.Raw");
+			}
+			SendMessages(address, bytes.ToArray(), deliveryMode);
 		}
-		Jobs.Add(new SendMessagesJob
-		{
-			Address = address,
-			DeliveryMode = deliveryMode,
-			Bytes = bytes.Select((byte[] b) => b.ToArray()).ToArray()
-		});
 	}
 
 	public int GetUnackedPacketsCount(IPEndPoint address)
 	{
-		CheckNotDisposed();
-		QueryUnackedPacketsJob queryUnackedPacketsJob = new QueryUnackedPacketsJob
+		lock (Lock)
 		{
-			Address = address
-		};
-		Jobs.Add(queryUnackedPacketsJob);
-		queryUnackedPacketsJob.CompletedEvent.WaitOne();
-		return queryUnackedPacketsJob.Result;
+			CheckNotDisposedAndStarted();
+			if (!Connections.TryGetValue(address, out var value))
+			{
+				return 0;
+			}
+			return value.UnackedPackets.Count;
+		}
 	}
 
 	public static double GetTime()
 	{
-		return (double)Stopwatch.GetTimestamp() / (double)Stopwatch.Frequency;
+		return (double)(Stopwatch.GetTimestamp() - StartTimestamp) / (double)Stopwatch.Frequency;
 	}
 
-	public static int Read7BitEncodedInt(BinaryReader reader)
+	private void AlarmFunction()
 	{
-		int num = 0;
-		int num2 = 0;
-		byte b;
-		do
+		lock (Lock)
 		{
-			if (num2 == 35)
+			if (!IsDisposed)
 			{
-				throw new FormatException();
+				ProcessConnections();
+				float num = 0.25f;
+				Alarm.Set(num * Settings.ResendPeriods[0]);
 			}
-			b = reader.ReadByte();
-			num |= (b & 0x7F) << num2;
-			num2 += 7;
-		}
-		while ((b & 0x80u) != 0);
-		return num;
-	}
-
-	public static void Write7BitEncodedInt(BinaryWriter writer, int value)
-	{
-		uint num;
-		for (num = (uint)value; num >= 128; num >>= 7)
-		{
-			writer.Write((byte)(num | 0x80u));
-		}
-		writer.Write((byte)num);
-	}
-
-	private void ThreadFunction()
-	{
-		while (!IsDisposed)
-		{
-			ProcessConnections();
-			double time = GetTime();
-			do
-			{
-				if (Jobs.TryTake(out var t, 10))
-				{
-					try
-					{
-						t.Execute(this);
-					}
-					catch (Exception obj)
-					{
-						this.Error?.Invoke(obj);
-					}
-				}
-			}
-			while (!IsDisposed && GetTime() - time < 0.2 * (double)Settings.ResendPeriods[0]);
 		}
 	}
 
 	private void ProcessReceivedPacket(Packet packet)
 	{
 		double time = GetTime();
-		BinaryReader binaryReader = new BinaryReader(new MemoryStream(packet.Data));
-		PacketHeader packetHeader = PacketHeader.Read(binaryReader);
+		Reader reader = new Reader(packet.Bytes);
+		PacketHeader packetHeader = PacketHeader.Read(reader);
 		if (packetHeader.IsInvalid)
 		{
-			this.Error?.Invoke(new InvalidOperationException($"Invalid packet header received from {packet.Address.ToString()}"));
+			InvokeError(new ProtocolViolationException($"Invalid packet header received from {packet.Address.ToString()}, dropping packet"));
 			return;
 		}
 		if (packetHeader.PacketType == PacketType.RawData)
 		{
-			int count = (int)(binaryReader.BaseStream.Length - binaryReader.BaseStream.Position);
-			byte[] bytes = binaryReader.ReadBytes(count);
-			FireReceivedEvent(packet.Address, bytes);
+			int count = reader.Length - reader.Position;
+			byte[] bytes = reader.ReadFixedBytes(count);
+			InvokeReceived(packet.Address, bytes);
 			return;
 		}
 		if (!Connections.TryGetValue(packet.Address, out var value))
@@ -468,12 +412,14 @@ public class Comm
 				{
 					value.NewTheirGuid(packetHeader.InitGuid);
 				}
-				SendInitAckPacket(packet.Address, packetHeader.InitGuid, value);
+				if (!value.InitAckConfirmed && time - value.LastInitAckSendTime >= (double)Settings.ResendPeriods[0])
+				{
+					SendInitAckPacket(packet.Address, packetHeader.InitGuid, value);
+				}
 			}
-			else if (value.TheirGuid == Guid.Empty)
+			else
 			{
-				this.Error?.Invoke(new InvalidOperationException($"No InitGuid in packet received from {packet.Address.ToString()}"));
-				return;
+				value.InitAckConfirmed = true;
 			}
 			bool flag = packetHeader.PacketType == PacketType.ReliableData;
 			if (flag)
@@ -491,16 +437,16 @@ public class Comm
 					return;
 				}
 				value.ReceivedPacketIdsCurrent.Add(packetHeader.PacketId);
-				while (binaryReader.BaseStream.Position < binaryReader.BaseStream.Length)
+				while (reader.Position < reader.Length)
 				{
-					MessagePartHeader messagePartHeader = MessagePartHeader.Read(binaryReader);
+					MessagePartHeader messagePartHeader = MessagePartHeader.Read(reader);
 					if (messagePartHeader.IsInvalid)
 					{
-						this.Error?.Invoke(new InvalidOperationException($"Invalid message part header received from {packet.Address.ToString()}"));
+						InvokeError(new ProtocolViolationException($"Invalid message part header received from {packet.Address.ToString()}, dropping rest of the packet"));
 						break;
 					}
-					int count2 = (int)((messagePartHeader.DataSize >= 0) ? messagePartHeader.DataSize : (binaryReader.BaseStream.Length - binaryReader.BaseStream.Position));
-					byte[] array = binaryReader.ReadBytes(count2);
+					int count2 = ((messagePartHeader.DataSize >= 0) ? messagePartHeader.DataSize : (reader.Length - reader.Position));
+					byte[] array = reader.ReadFixedBytes(count2);
 					if (messagePartHeader.PartIndex == 0 && messagePartHeader.IsFinalPart)
 					{
 						ProcessReceivedMessage(packet.Address, value, messagePartHeader, array, flag);
@@ -551,23 +497,26 @@ public class Comm
 		}
 		else if (packetHeader.PacketType == PacketType.DataAck)
 		{
-			while (binaryReader.BaseStream.Length - binaryReader.BaseStream.Position >= 4)
+			while (reader.Length - reader.Position >= 4)
 			{
-				uint key = binaryReader.ReadUInt32();
+				uint key = reader.ReadUInt32();
 				value.UnackedPackets.Remove(key);
+			}
+		}
+		else if (packetHeader.PacketType == PacketType.InitAck)
+		{
+			if (packetHeader.InitGuid == value.OurGuid)
+			{
+				value.InitAckReceived = true;
+			}
+			else
+			{
+				InvokeError(new ProtocolViolationException($"Invalid InitAck Guid received from {packet.Address.ToString()} (received {packetHeader.InitGuid.ToString()}, expected {value.OurGuid.ToString()}), ignoring"));
 			}
 		}
 		else
 		{
-			if (packetHeader.PacketType != PacketType.InitAck)
-			{
-				throw new InvalidOperationException($"Invalid packet type received from {packet.Address.ToString()}");
-			}
-			if (!(packetHeader.InitGuid == value.OurGuid))
-			{
-				throw new InvalidOperationException($"Invalid InitAck GUID received from {packet.Address.ToString()}");
-			}
-			value.InitAckReceived = true;
+			InvokeError(new ProtocolViolationException($"Invalid packet type {(int)packetHeader.PacketType} received from {packet.Address.ToString()}, ignoring"));
 		}
 	}
 
@@ -580,13 +529,13 @@ public class Comm
 				if (!connection.NextReliableReceiveSequenceIndex.HasValue || messagePartHeader.SequenceIndex.Value == connection.NextReliableReceiveSequenceIndex)
 				{
 					connection.NextReliableReceiveSequenceIndex = messagePartHeader.SequenceIndex.Value + 1;
-					FireReceivedEvent(address, bytes);
+					InvokeReceived(address, bytes);
 					byte[] value;
 					while (connection.SequencedBytes.TryGetValue(connection.NextReliableReceiveSequenceIndex.Value, out value))
 					{
 						connection.SequencedBytes.Remove(connection.NextReliableReceiveSequenceIndex.Value);
 						connection.NextReliableReceiveSequenceIndex++;
-						FireReceivedEvent(address, value);
+						InvokeReceived(address, value);
 					}
 				}
 				else
@@ -597,34 +546,13 @@ public class Comm
 			else if (!connection.NextUnreliableReceiveSequenceIndex.HasValue || CompareSequenceNumbers(messagePartHeader.SequenceIndex.Value, connection.NextUnreliableReceiveSequenceIndex.Value) >= 0)
 			{
 				connection.NextUnreliableReceiveSequenceIndex = messagePartHeader.SequenceIndex.Value + 1;
-				FireReceivedEvent(address, bytes);
+				InvokeReceived(address, bytes);
 			}
 		}
 		else
 		{
-			FireReceivedEvent(address, bytes);
+			InvokeReceived(address, bytes);
 		}
-	}
-
-	private void FireReceivedEvent(IPEndPoint address, byte[] bytes)
-	{
-		try
-		{
-			this.Received?.Invoke(new Packet(address, bytes));
-		}
-		catch (Exception obj)
-		{
-			this.Error?.Invoke(obj);
-		}
-	}
-
-	private int QueryUnackedPacketsCount(IPEndPoint address)
-	{
-		if (!Connections.TryGetValue(address, out var value))
-		{
-			return 0;
-		}
-		return value.UnackedPackets.Count;
 	}
 
 	private void ProcessConnections()
@@ -678,7 +606,7 @@ public class Comm
 				value.ReceivedPacketIdsCurrent = receivedPacketIdsOld;
 				value.LastReceivedPacketsIdsSwitchTime = time;
 			}
-			if (time - value.LastSendTime >= (double)Settings.IdleTime && time - value.LastReceiveTime >= (double)(2f * Settings.IdleTime))
+			if (time - value.LastSendTime >= (double)Settings.IdleTime && time - value.LastReceiveTime >= (double)Settings.IdleTime)
 			{
 				ToRemoveEndpoint.Add(key);
 			}
@@ -694,12 +622,12 @@ public class Comm
 	{
 		if (deliveryMode == DeliveryMode.Raw)
 		{
-			foreach (byte[] buffer in bytes)
+			foreach (byte[] bytes2 in bytes)
 			{
-				BinaryWriter binaryWriter = new BinaryWriter(new MemoryStream());
-				PacketHeader.WriteRaw(binaryWriter);
-				binaryWriter.Write(buffer);
-				Transmitter.SendPacket(new Packet(address, ((MemoryStream)binaryWriter.BaseStream).ToArray()));
+				Writer writer = new Writer();
+				PacketHeader.WriteRaw(writer);
+				writer.WriteFixedBytes(bytes2);
+				Transmitter.SendPacket(new Packet(address, writer.GetBytes()));
 			}
 			return;
 		}
@@ -708,7 +636,7 @@ public class Comm
 			value = new Connection();
 			Connections.Add(address, value);
 		}
-		BinaryWriter binaryWriter2 = null;
+		Writer writer2 = null;
 		byte[] array = null;
 		int num = 0;
 		uint packetId = 0u;
@@ -735,50 +663,50 @@ public class Comm
 				};
 				num2 = 0;
 			}
-			if (binaryWriter2 == null)
+			if (writer2 == null)
 			{
-				binaryWriter2 = new BinaryWriter(new MemoryStream());
+				writer2 = new Writer();
 				packetId = NextPacketId;
 				NextPacketId++;
 				Guid? initGuid = (value.InitAckReceived ? null : new Guid?(value.OurGuid));
-				PacketHeader.WriteData(binaryWriter2, initGuid, packetId, deliveryMode == DeliveryMode.Reliable || deliveryMode == DeliveryMode.ReliableSequenced);
+				PacketHeader.WriteData(writer2, initGuid, packetId, deliveryMode == DeliveryMode.Reliable || deliveryMode == DeliveryMode.ReliableSequenced);
 			}
-			int num4 = (int)binaryWriter2.BaseStream.Length;
-			int num5 = array.Length - num;
-			MessagePartHeader.Write(binaryWriter2, messageId, sequenceIndex, num2, isFinalPart: true, num5);
-			if (binaryWriter2.BaseStream.Length + num5 <= Transmitter.MaxPacketSize)
+			int position = writer2.Position;
+			int num4 = array.Length - num;
+			MessagePartHeader.Write(writer2, messageId, sequenceIndex, num2, isFinalPart: true, num4);
+			if (writer2.Position + num4 <= Transmitter.MaxPacketSize)
 			{
-				binaryWriter2.Write(array, num, num5);
+				writer2.WriteFixedBytes(array, num, num4);
 				array = null;
 				continue;
 			}
-			binaryWriter2.BaseStream.SetLength(num4);
-			MessagePartHeader.Write(binaryWriter2, messageId, sequenceIndex, num2, isFinalPart: true, -1);
-			if (binaryWriter2.BaseStream.Length + num5 <= Transmitter.MaxPacketSize)
+			writer2.Length = position;
+			MessagePartHeader.Write(writer2, messageId, sequenceIndex, num2, isFinalPart: true, -1);
+			if (writer2.Position + num4 <= Transmitter.MaxPacketSize)
 			{
-				binaryWriter2.Write(array, num, num5);
+				writer2.WriteFixedBytes(array, num, num4);
 				array = null;
 				continue;
 			}
-			binaryWriter2.BaseStream.SetLength(num4);
-			MessagePartHeader.Write(binaryWriter2, messageId, sequenceIndex, num2, isFinalPart: false, -1);
-			num5 = Transmitter.MaxPacketSize - (int)binaryWriter2.BaseStream.Length;
-			if (num5 > 0)
+			writer2.Length = position;
+			MessagePartHeader.Write(writer2, messageId, sequenceIndex, num2, isFinalPart: false, -1);
+			num4 = Transmitter.MaxPacketSize - writer2.Position;
+			if (num4 > 0)
 			{
-				binaryWriter2.Write(array, num, num5);
-				num += num5;
+				writer2.WriteFixedBytes(array, num, num4);
+				num += num4;
 				num2++;
 			}
 			else
 			{
-				binaryWriter2.BaseStream.SetLength(num4);
+				writer2.Length = position;
 			}
-			SendDataPacket(address, ((MemoryStream)binaryWriter2.BaseStream).ToArray(), packetId, deliveryMode, value);
-			binaryWriter2 = null;
+			SendDataPacket(address, writer2.GetBytes(), packetId, deliveryMode, value);
+			writer2 = null;
 		}
-		if (binaryWriter2 != null && binaryWriter2.BaseStream.Position > 0)
+		if (writer2 != null && writer2.Position > 0)
 		{
-			SendDataPacket(address, ((MemoryStream)binaryWriter2.BaseStream).ToArray(), packetId, deliveryMode, value);
+			SendDataPacket(address, writer2.GetBytes(), packetId, deliveryMode, value);
 		}
 	}
 
@@ -802,23 +730,24 @@ public class Comm
 		int num = 0;
 		while (num < acks.Count)
 		{
-			BinaryWriter binaryWriter = new BinaryWriter(new MemoryStream());
-			PacketHeader.WriteDataAck(binaryWriter);
-			int num2 = Transmitter.MaxPacketSize - (int)binaryWriter.BaseStream.Position;
+			Writer writer = new Writer();
+			PacketHeader.WriteDataAck(writer);
+			int num2 = Transmitter.MaxPacketSize - writer.Position;
 			int num3 = Math.Min(val2: acks.Count - num, val1: num2 / 4);
 			for (int i = 0; i < num3; i++)
 			{
-				binaryWriter.Write(acks[num++]);
+				writer.WriteUInt32(acks[num++]);
 			}
-			SendPacket(new Packet(address, ((MemoryStream)binaryWriter.BaseStream).ToArray()), connection);
+			SendPacket(new Packet(address, writer.GetBytes()), connection);
 		}
 	}
 
 	private void SendInitAckPacket(IPEndPoint address, Guid initGuid, Connection connection)
 	{
-		BinaryWriter binaryWriter = new BinaryWriter(new MemoryStream());
-		PacketHeader.WriteInitAck(binaryWriter, initGuid);
-		SendPacket(new Packet(address, ((MemoryStream)binaryWriter.BaseStream).ToArray()), connection);
+		connection.LastInitAckSendTime = GetTime();
+		Writer writer = new Writer();
+		PacketHeader.WriteInitAck(writer, initGuid);
+		SendPacket(new Packet(address, writer.GetBytes()), connection);
 	}
 
 	private void SendPacket(Packet packet, Connection connection)
@@ -832,6 +761,41 @@ public class Comm
 		if (IsDisposed)
 		{
 			throw new ObjectDisposedException("Comm");
+		}
+	}
+
+	private void CheckNotDisposedAndStarted()
+	{
+		CheckNotDisposed();
+		if (Alarm == null)
+		{
+			throw new InvalidOperationException("Comm is not started.");
+		}
+	}
+
+	private void InvokeReceived(IPEndPoint address, byte[] bytes)
+	{
+		try
+		{
+			this.Received?.Invoke(new Packet(address, bytes));
+		}
+		catch (Exception error)
+		{
+			InvokeError(error);
+		}
+	}
+
+	private void InvokeError(Exception error)
+	{
+		this.Error?.Invoke(error);
+	}
+
+	[Conditional("DEBUG")]
+	private void InvokeDebug(string format, params object[] args)
+	{
+		if (this.Debug != null)
+		{
+			this.Debug?.Invoke(string.Format(format, args));
 		}
 	}
 
